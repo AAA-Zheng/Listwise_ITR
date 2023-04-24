@@ -37,7 +37,7 @@ def main():
                         help='tau.')
     parser.add_argument('--num_epochs', default=20, type=int,
                         help='Number of training epochs.')
-    parser.add_argument('--lr_update', default=10, type=int,
+    parser.add_argument('--lr_update', default=20, type=int,
                         help='Number of epochs to update the learning rate.')
     parser.add_argument('--logger_name', default='',
                         help='Path to save Tensorboard log.')
