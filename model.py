@@ -120,163 +120,6 @@ def sigmoid(tensor, tau=1.0):
     return y
 
 
-class TripletLoss(nn.Module):
-
-    def __init__(self, opt):
-        super(TripletLoss, self).__init__()
-        self.margin = opt.margin
-        self.batch_size = opt.batch_size
-        self.pos_mask = torch.eye(self.batch_size).cuda()
-        self.neg_mask = 1 - self.pos_mask
-
-    def forward(self, v, t):
-
-        batch_size = v.size(0)
-
-        scores = cosine_sim(v, t)
-        pos_scores = scores.diag().view(batch_size, 1)
-        pos_scores_t = pos_scores.expand_as(scores)
-        pos_scores_v = pos_scores.t().expand_as(scores)
-
-        if batch_size != self.batch_size:
-            pos_mask = torch.eye(scores.size(0))
-            pos_mask = pos_mask.cuda()
-            neg_mask = 1 - pos_mask
-        else:
-            neg_mask = self.neg_mask
-
-        loss_t = (scores - pos_scores_t + self.margin).clamp(min=0)
-        loss_v = (scores - pos_scores_v + self.margin).clamp(min=0)
-        loss_t = loss_t * neg_mask
-        loss_v = loss_v * neg_mask
-        loss_t = loss_t.max(dim=1)[0]
-        loss_v = loss_v.max(dim=0)[0]
-        loss_t = loss_t.mean()
-        loss_v = loss_v.mean()
-        loss = (loss_t + loss_v) / 2
-
-        return loss
-
-
-class SNDCGLoss(nn.Module):
-
-    def __init__(self, opt):
-
-        super(SNDCGLoss, self).__init__()
-        self.tau = opt.tau
-        self.batch_size = opt.batch_size
-        self.pos_mask = torch.eye(self.batch_size).cuda()
-        self.neg_mask = 1 - self.pos_mask
-
-    def forward(self, v, t, v_text_emb, t_text_emb):
-
-        batch_size = v.size(0)
-
-        scores = cosine_sim(v, t)
-
-        if batch_size != self.batch_size:
-            pos_mask = torch.eye(scores.size(0))
-            pos_mask = pos_mask.cuda()
-            neg_mask = 1 - pos_mask
-        else:
-            pos_mask = self.pos_mask
-            neg_mask = self.neg_mask
-
-        # calculate relevance score
-        v_text_emb = v_text_emb.cuda()
-        t_text_emb = t_text_emb.cuda()
-
-        v_text_emb = v_text_emb.transpose(0, 1)
-        t_text_emb = t_text_emb.view(1, t_text_emb.size(0), t_text_emb.size(1))
-        t_text_emb = t_text_emb.expand(5, t_text_emb.size(1), t_text_emb.size(2))
-
-        v_text_emb = l2norm_3d(v_text_emb)
-        t_text_emb = l2norm_3d(t_text_emb)
-        relevance = torch.bmm(v_text_emb, t_text_emb.transpose(1, 2))
-        relevance = relevance.max(0)[0]
-
-        # norm
-        relevance = (1 + relevance) / 2  # [0, 1]
-        relevance = relevance * neg_mask + pos_mask
-
-        # IDCG
-        relevance_repeat = relevance.unsqueeze(dim=2).repeat(1, 1, relevance.size(0))
-        relevance_repeat_trans = relevance_repeat.permute(0, 2, 1)
-        relevance_diff = relevance_repeat_trans - relevance_repeat
-        relevance_indicator = torch.where(relevance_diff > 0,
-                                          torch.full_like(relevance_diff, 1),
-                                          torch.full_like(relevance_diff, 0))
-        relevance_rk = torch.sum(relevance_indicator, dim=-1) + 1
-        idcg = (2 ** relevance - 1) / torch.log2(1 + relevance_rk)
-        idcg = torch.sum(idcg, dim=-1)
-
-        # scores diff
-        scores_repeat_t = scores.unsqueeze(dim=2).repeat(1, 1, scores.size(0))
-        scores_repeat_trans_t = scores_repeat_t.permute(0, 2, 1)
-        scores_diff_t = scores_repeat_trans_t - scores_repeat_t
-
-        scores_repeat_v = scores.t().unsqueeze(dim=2).repeat(1, 1, scores.size(0))
-        scores_repeat_trans_v = scores_repeat_v.permute(0, 2, 1)
-        scores_diff_v = scores_repeat_trans_v - scores_repeat_v
-
-        # image-to-text
-        scores_sg_t = sigmoid(scores_diff_t, tau=self.tau)
-
-        scores_sg_t = scores_sg_t * neg_mask
-        scores_rk_t = torch.sum(scores_sg_t, dim=-1) + 1
-
-        scores_indicator_t = torch.where(scores_diff_t > 0,
-                                         torch.full_like(scores_diff_t, 1),
-                                         torch.full_like(scores_diff_t, 0))
-        real_scores_rk_t = torch.sum(scores_indicator_t, dim=-1) + 1
-
-        dcg_t = (2 ** relevance - 1) / torch.log2(1 + scores_rk_t)
-        dcg_t = torch.sum(dcg_t, dim=-1)
-
-        real_dcg_t = (2 ** relevance - 1) / torch.log2(1 + real_scores_rk_t)
-        real_dcg_t = torch.sum(real_dcg_t, dim=-1)
-
-        # text-to-image
-        scores_sg_v = sigmoid(scores_diff_v, tau=self.tau)
-
-        scores_sg_v = scores_sg_v * neg_mask
-        scores_rk_v = torch.sum(scores_sg_v, dim=-1) + 1
-
-        scores_indicator_v = torch.where(scores_diff_v > 0,
-                                         torch.full_like(scores_diff_v, 1),
-                                         torch.full_like(scores_diff_v, 0))
-        real_scores_rk_v = torch.sum(scores_indicator_v, dim=-1) + 1
-
-        dcg_v = (2 ** relevance - 1) / torch.log2(1 + scores_rk_v)
-        dcg_v = torch.sum(dcg_v, dim=-1)
-
-        real_dcg_v = (2 ** relevance - 1) / torch.log2(1 + real_scores_rk_v)
-        real_dcg_v = torch.sum(real_dcg_v, dim=-1)
-
-        # NDCG
-        real_ndcg_t = real_dcg_t / idcg
-        real_ndcg_v = real_dcg_v / idcg
-
-        real_ndcg_t = torch.mean(real_ndcg_t)
-        real_ndcg_v = torch.mean(real_ndcg_v)
-
-        ndcg_t = dcg_t / idcg
-        ndcg_v = dcg_v / idcg
-
-        loss_t = 1 - ndcg_t
-        loss_v = 1 - ndcg_v
-
-        ndcg_t = torch.mean(ndcg_t)
-        ndcg_v = torch.mean(ndcg_v)
-
-        loss_t = torch.mean(loss_t)
-        loss_v = torch.mean(loss_v)
-
-        loss = (loss_t + loss_v) / 2
-
-        return loss, ndcg_t, real_ndcg_t, ndcg_v, real_ndcg_v
-
-
 class TripletSNDCGLoss(nn.Module):
 
     def __init__(self, opt):
@@ -431,13 +274,7 @@ class VSE(object):
             cudnn.benchmark = True
 
         # Loss and Optimizer
-        self.loss = opt.loss
-        if self.loss == 'triplet':
-            self.criterion = TripletLoss(opt)
-        if self.loss == 'sndcg':
-            self.criterion = SNDCGLoss(opt)
-        if self.loss == 'triplet_sndcg':
-            self.criterion = TripletSNDCGLoss(opt)
+        self.criterion = TripletSNDCGLoss(opt)
 
         params = list(self.txt_enc.parameters())
         params += list(self.img_enc.parameters())
@@ -480,26 +317,14 @@ class VSE(object):
     def forward_loss(self, img_emb, cap_emb, v_text_emb, t_text_emb, **kwargs):
         """Compute the loss given pairs of image and caption embeddings
         """
-        if self.loss in ['triplet']:
-            loss = self.criterion(img_emb, cap_emb)
-            self.logger.update('L', loss.item(), img_emb.size(0))
-        if self.loss in ['sndcg']:
-            loss, ndcg_t, real_ndcg_t, ndcg_v, real_ndcg_v = self.criterion(img_emb, cap_emb, v_text_emb, t_text_emb)
-            self.logger.update('L', loss.item(), img_emb.size(0))
-            self.logger.update('N1', ndcg_t.item(), img_emb.size(0))
-            self.logger.update('RN1', real_ndcg_t.item(), img_emb.size(0))
-            self.logger.update('N2', ndcg_v.item(), img_emb.size(0))
-            self.logger.update('RN2', real_ndcg_v.item(), img_emb.size(0))
-        if self.loss in ['triplet_sndcg']:
-            loss, pairwise_loss, listwise_loss, ndcg_t, real_ndcg_t, ndcg_v, real_ndcg_v = \
-                self.criterion(img_emb, cap_emb, v_text_emb, t_text_emb)
-            self.logger.update('L', loss.item(), img_emb.size(0))
-            self.logger.update('PL', pairwise_loss.item(), img_emb.size(0))
-            self.logger.update('LL', listwise_loss.item(), img_emb.size(0))
-            self.logger.update('N1', ndcg_t.item(), img_emb.size(0))
-            self.logger.update('RN1', real_ndcg_t.item(), img_emb.size(0))
-            self.logger.update('N2', ndcg_v.item(), img_emb.size(0))
-            self.logger.update('RN2', real_ndcg_v.item(), img_emb.size(0))
+        loss, pairwise_loss, listwise_loss, ndcg_t, real_ndcg_t, ndcg_v, real_ndcg_v = self.criterion(img_emb, cap_emb, v_text_emb, t_text_emb)
+        self.logger.update('L', loss.item(), img_emb.size(0))
+        self.logger.update('PL', pairwise_loss.item(), img_emb.size(0))
+        self.logger.update('LL', listwise_loss.item(), img_emb.size(0))
+        self.logger.update('N1', ndcg_t.item(), img_emb.size(0))
+        self.logger.update('RN1', real_ndcg_t.item(), img_emb.size(0))
+        self.logger.update('N2', ndcg_v.item(), img_emb.size(0))
+        self.logger.update('RN2', real_ndcg_v.item(), img_emb.size(0))
 
         return loss
 
